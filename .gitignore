@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.gemini_api_key
+.venv/
+venv/
+models/

@@ -1,0 +1,61 @@
+steps:
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud artifacts repositories describe ${_REPOSITORY} --location ${_REGION} \
+          || gcloud artifacts repositories create ${_REPOSITORY} \
+            --repository-format docker \
+            --location ${_REGION} \
+            --description "Docker images for Cloud Run"
+  - name: gcr.io/cloud-builders/docker
+    secretEnv:
+      - HF_TOKEN
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - build
+      - --secret
+      - id=HF_TOKEN,env=HF_TOKEN
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$BUILD_ID
+      - .
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$BUILD_ID
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$BUILD_ID
+      - --region
+      - ${_REGION}
+      - --platform
+      - managed
+      - --memory
+      - 8Gi
+      - --cpu
+      - "2"
+      - --timeout
+      - "600"
+      - --set-env-vars
+      - GOOGLE_CLOUD_LOCATION=${_GOOGLE_CLOUD_LOCATION}
+      - --set-secrets
+      - GOOGLE_CLOUD_API_KEY=${_GEMINI_API_KEY_SECRET}:latest
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY}/${_SERVICE}:$BUILD_ID
+substitutions:
+  _SERVICE: freedom-score-api
+  _REGION: us-central1
+  _REPOSITORY: cloud-run-source-deploy
+  _GOOGLE_CLOUD_LOCATION: us-central1
+  _GEMINI_API_KEY_SECRET: google-cloud-api-key
+availableSecrets:
+  secretManager:
+    - versionName: projects/$PROJECT_ID/secrets/huggingface-token/versions/latest
+      env: HF_TOKEN
