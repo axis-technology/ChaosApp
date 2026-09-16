@@ -27,6 +27,7 @@ import pickle
 import re
 import subprocess
 import html
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, cast
@@ -814,6 +815,15 @@ def embedding_output(list_value: Sequence[str]) -> List[List[float]]:
     return gemini_embeddings_batch(list_value)
 
 
+def _generate_and_embed_component(text: str, paraphrase_count: int) -> Tuple[List[str], List[List[float]]]:
+    """Paraphrase one component and embed the result. Runs entirely for one
+    component (cultural_observation / problem_to_solve / solution) at a time,
+    so callers can run three of these concurrently - the components don't
+    depend on each other."""
+    phrase_list = generate_idea_paraphrases(text, n=paraphrase_count) + [clean_text(text)]
+    return phrase_list, embedding_output(phrase_list)
+
+
 def preprocessing_value_generation(
     cultural_observation: str,
     problem_to_solve: str,
@@ -824,20 +834,30 @@ def preprocessing_value_generation(
     """Create one fixed paraphrase and embedding bundle for an idea.
 
     The original phrase is appended to the generated paraphrases, so each field
-    has `paraphrase_count + 1` variants.
+    has `paraphrase_count + 1` variants. The three components are independent
+    of each other (each is paraphrased and embedded from its own input text
+    only), so their Gemini calls run concurrently in a thread pool instead of
+    one component's paraphrase-then-embed sequence finishing before the next
+    one starts - these are network-bound calls, so threads give real
+    concurrency here despite the GIL.
     """
-    cultural_observation_list = (
-        generate_idea_paraphrases(cultural_observation, n=paraphrase_count)
-        + [clean_text(cultural_observation)]
-    )
-    problem_to_solve_list = (
-        generate_idea_paraphrases(problem_to_solve, n=paraphrase_count)
-        + [clean_text(problem_to_solve)]
-    )
-    solution_list = (
-        generate_idea_paraphrases(solution, n=paraphrase_count)
-        + [clean_text(solution)]
-    )
+    keys = ("cultural_observation", "problem_to_solve", "solution")
+    texts = {
+        "cultural_observation": cultural_observation,
+        "problem_to_solve": problem_to_solve,
+        "solution": solution,
+    }
+
+    paraphrases: Dict[str, List[str]] = {}
+    embeddings: Dict[str, List[List[float]]] = {}
+
+    with ThreadPoolExecutor(max_workers=len(keys)) as executor:
+        futures = {
+            key: executor.submit(_generate_and_embed_component, texts[key], paraphrase_count)
+            for key in keys
+        }
+        for key in keys:
+            paraphrases[key], embeddings[key] = futures[key].result()
 
     return {
         "input": {
@@ -845,16 +865,8 @@ def preprocessing_value_generation(
             "problem_to_solve": clean_text(problem_to_solve),
             "solution": clean_text(solution),
         },
-        "paraphrases": {
-            "cultural_observation": cultural_observation_list,
-            "problem_to_solve": problem_to_solve_list,
-            "solution": solution_list,
-        },
-        "embeddings": {
-            "cultural_observation": embedding_output(cultural_observation_list),
-            "problem_to_solve": embedding_output(problem_to_solve_list),
-            "solution": embedding_output(solution_list),
-        },
+        "paraphrases": paraphrases,
+        "embeddings": embeddings,
     }
 
 
