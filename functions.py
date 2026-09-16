@@ -415,7 +415,7 @@ def load_local_causal_lm(model_name: str = CAUSAL_LM_MODEL):
         # which makes model.to(device) fail at runtime in Cloud Run.
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=dtype,
+            torch_dtype=dtype,
             low_cpu_mem_usage=False,
             local_files_only=local_only,
         )
