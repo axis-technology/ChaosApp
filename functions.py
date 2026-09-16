@@ -29,7 +29,7 @@ import subprocess
 import html
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, cast
 
 import pandas as pd
 import numpy as np
@@ -246,6 +246,52 @@ def gemini_embedding(text: str, *, model: str = GEMINI_EMBEDDING_MODEL) -> List[
     vector = list(response.embeddings[0].values)
     _embedding_cache[cache_key] = vector
     return vector
+
+
+def gemini_embeddings_batch(
+    texts: Sequence[str], *, model: str = GEMINI_EMBEDDING_MODEL
+) -> List[List[float]]:
+    """Embed multiple texts in one Gemini API call, preserving input order.
+
+    Cache hits are served without a network call, same as `gemini_embedding`;
+    only the texts not already cached are sent, and as a single batched
+    request rather than one request per text. This is the fix for
+    `embedding_output` calling `gemini_embedding` in a per-item loop, which
+    turned every 5-text batch (4 paraphrases + the original) into 5
+    sequential round trips instead of 1.
+    """
+    cleaned = [clean_text(text) for text in texts]
+    results: List[Optional[List[float]]] = [None] * len(cleaned)
+    pending_indices: List[int] = []
+    pending_texts: List[str] = []
+
+    for i, text in enumerate(cleaned):
+        cache_key = f"{model}::{text}"
+        cached = _embedding_cache.get(cache_key)
+        if cached is not None:
+            results[i] = cached
+        else:
+            pending_indices.append(i)
+            pending_texts.append(text)
+
+    if pending_texts:
+        client = get_gemini_client()
+        response = client.models.embed_content(
+            model=model,
+            contents=pending_texts,
+            config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+        )
+        if len(response.embeddings) != len(pending_texts):
+            raise ValueError(
+                "Embedding response length mismatch: expected "
+                f"{len(pending_texts)}, got {len(response.embeddings)}"
+            )
+        for index, text, embedding in zip(pending_indices, pending_texts, response.embeddings):
+            vector = list(embedding.values)
+            _embedding_cache[f"{model}::{text}"] = vector
+            results[index] = vector
+
+    return cast(List[List[float]], results)
 
 
 def cosine_similarity(vector_a: Sequence[float], vector_b: Sequence[float]) -> float:
@@ -764,8 +810,8 @@ Return valid JSON again. Every field must have exactly {target_words} words."""
 
 
 def embedding_output(list_value: Sequence[str]) -> List[List[float]]:
-    """Embed a list of phrases with Gemini."""
-    return [gemini_embedding(term) for term in list_value]
+    """Embed a list of phrases with Gemini in a single batched call."""
+    return gemini_embeddings_batch(list_value)
 
 
 def preprocessing_value_generation(
