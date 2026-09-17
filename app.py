@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict
 import os
 import time
+import logging
 
 from flask import Flask, jsonify, request
 
@@ -16,10 +17,13 @@ BASE_DIR = Path(__file__).resolve().parent
 BASELINE_PATH = BASE_DIR / "baseline_full.json"
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 baseline = load_baseline_dict(BASELINE_PATH)
 # Initialize the local model during instance startup. The loader caches the
 # tokenizer and model globally, so requests do not reload it.
+model_started = time.perf_counter()
 load_local_causal_lm()
+app.logger.info("score_timing stage=model_startup seconds=%.3f", time.perf_counter() - model_started)
 
 
 @app.after_request

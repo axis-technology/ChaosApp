@@ -64,6 +64,7 @@ _local_model_name = None
 _embedding_cache: Dict[str, List[float]] = {}
 _surprise_cache: Dict[Tuple[str, str, str], Dict[str, object]] = {}
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 
 def _load_torch():
