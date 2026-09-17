@@ -63,7 +63,7 @@ _local_model = None
 _local_model_name = None
 _embedding_cache: Dict[str, List[float]] = {}
 _surprise_cache: Dict[Tuple[str, str, str], Dict[str, object]] = {}
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("app")
 logger.setLevel(logging.INFO)
 
 
