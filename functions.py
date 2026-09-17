@@ -27,6 +27,8 @@ import pickle
 import re
 import subprocess
 import html
+import logging
+import time
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, cast
@@ -61,6 +63,7 @@ _local_model = None
 _local_model_name = None
 _embedding_cache: Dict[str, List[float]] = {}
 _surprise_cache: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+logger = logging.getLogger(__name__)
 
 
 def _load_torch():
@@ -1226,38 +1229,53 @@ def full_analysis(
     paraphrase_count: int = 4,
 ) -> Dict[str, object]:
     """Standardize one campaign idea, extract components, and score it."""
+    analysis_started = time.perf_counter()
+    stage_started = time.perf_counter()
     standardized_idea = standardize_idea(campaign)
+    logger.info("score_timing stage=standardize_idea seconds=%.3f", time.perf_counter() - stage_started)
+
+    stage_started = time.perf_counter()
     components_idea = extract_campaign_components(
         standardized_idea,
         target_words=target_words,
         use_web_search=use_web_search,
     )
+    logger.info("score_timing stage=extract_components seconds=%.3f", time.perf_counter() - stage_started)
+
+    stage_started = time.perf_counter()
     campaign_embed_paraphrases = preprocessing_value_generation(
         cultural_observation=components_idea["cultural_observation"],
         problem_to_solve=components_idea["problem_to_solve"],
         solution=components_idea["solution"],
         paraphrase_count=paraphrase_count,
     )
+    logger.info("score_timing stage=paraphrases_and_embeddings seconds=%.3f", time.perf_counter() - stage_started)
 
-
+    stage_started = time.perf_counter()
     distance = distance_from_multiple_baselines(baseline, campaign_embed_paraphrases)
     distance_score = distance["distance_score"]
     distance_std= distance['distance_score_std']
+    logger.info("score_timing stage=distance seconds=%.3f", time.perf_counter() - stage_started)
 
+    stage_started = time.perf_counter()
     surprise = calc_surprise(campaign_embed_paraphrases)
     surprise_score = surprise["mean"]
     surprise_std = surprise["std"]
+    logger.info("score_timing stage=surprise seconds=%.3f", time.perf_counter() - stage_started)
 
+    stage_started = time.perf_counter()
     tension = calculate_incongruity(campaign_embed_paraphrases)
     tension_score = calculate_weighted_score_tension(tension)
     tension_std = calculate_weighted_score_tension(tension,'std')
+    logger.info("score_timing stage=tension seconds=%.3f", time.perf_counter() - stage_started)
 
-
+    stage_started = time.perf_counter()
     basic_score_result = predict_basicness_from_scores(distance_score=distance_score,
                                                 surprise_score=surprise_score,
                                                 text=standardized_idea)
 
     basic_score, probability = normalize_basicness_result(basic_score_result)
+    logger.info("score_timing stage=basicness seconds=%.3f", time.perf_counter() - stage_started)
 
     universal_score_high = universal_score(distance_score+distance_std*2, 
                                            surprise_score+surprise_std*2,
@@ -1270,6 +1288,7 @@ def full_analysis(
                                            surprise_score-surprise_std*2,
                                            tension_score-tension_std*2, 
                                            basic_score,probability)
+    logger.info("score_timing stage=total seconds=%.3f", time.perf_counter() - analysis_started)
     
     return {
         "parts": {

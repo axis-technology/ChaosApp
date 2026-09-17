@@ -5,10 +5,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 import os
+import time
 
 from flask import Flask, jsonify, request
 
-from functions import full_analysis, load_baseline_dict
+from functions import full_analysis, load_baseline_dict, load_local_causal_lm
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -16,6 +17,9 @@ BASELINE_PATH = BASE_DIR / "baseline_full.json"
 
 app = Flask(__name__)
 baseline = load_baseline_dict(BASELINE_PATH)
+# Initialize the local model during instance startup. The loader caches the
+# tokenizer and model globally, so requests do not reload it.
+load_local_causal_lm()
 
 
 @app.after_request
@@ -59,7 +63,9 @@ def score_campaign():
         return jsonify({"error": "`idea` must be a non-empty string."}), 400
 
     try:
+        started = time.perf_counter()
         result = full_analysis(idea.strip(), baseline)
+        app.logger.info("score_timing stage=request_total seconds=%.3f", time.perf_counter() - started)
     except Exception as exc:
         app.logger.exception("Campaign scoring failed")
         return jsonify({"error": "Campaign scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
