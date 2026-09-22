@@ -1094,6 +1094,79 @@ def calc_surprise(
     return summary
 
 
+def score_solution_surprise(
+    solution: str,
+    *,
+    paraphrase_count: int = 4,
+    context: str = "An example of a marketing campaign is",
+) -> Dict[str, object]:
+    """Score one solution using the same method as the main surprise score.
+
+    The original solution plus semantic-preserving paraphrases are scored with
+    Qwen, then averaged so the result is less dependent on one exact wording.
+    """
+    solutions = generate_idea_paraphrases(solution, n=paraphrase_count) + [clean_text(solution)]
+    scores = [
+        score_surprise(context=context, candidate=variant.lower())["avg_surprise_bits"]
+        for variant in solutions
+    ]
+    summary = summarize_values(scores)
+    summary["solution"] = clean_text(solution)
+    summary["variants"] = solutions
+    summary["scores"] = scores
+    return summary
+
+
+def generate_surprise_thoughtstarters(
+    cultural_observation: str,
+    brand_problem: str,
+    *,
+    count: int = 5,
+) -> Dict[str, List[str]]:
+    """Generate conventional and deliberately chaotic solutions.
+
+    Both sets use the same observation and problem. Because this endpoint does
+    not receive an existing solution, "more chaotic" means more unexpected,
+    indirect, and creatively disproportionate than a conventional solution;
+    "less chaotic" means direct, familiar, and easy to predict.
+    """
+    system_instruction = """You generate advertising campaign solution thoughtstarters.
+
+Return only valid JSON with exactly this schema:
+{"more_chaotic": ["..."], "less_chaotic": ["..."]}
+
+Generate exactly the requested number of unique solutions in each list.
+Every solution must describe a concrete campaign action or mechanism that a
+brand could execute. Keep each solution to one concise sentence.
+
+more_chaotic solutions should be surprising, indirect, strange, or
+unexpectedly connected to the observation and problem while still being
+coherent and executable.
+less_chaotic solutions should be direct, familiar, conventional, and easy to
+predict from the observation and problem.
+
+Do not explain the ideas, add headings, or include scores."""
+    prompt = f"""Cultural observation:
+{clean_text(cultural_observation)}
+
+Brand problem:
+{clean_text(brand_problem)}
+
+Generate exactly {count} more chaotic and exactly {count} less chaotic solutions."""
+    result = gemini_json(prompt, system_instruction, temperature=0.8, max_output_tokens=4096)
+
+    output: Dict[str, List[str]] = {}
+    for key in ("more_chaotic", "less_chaotic"):
+        values = result.get(key)
+        if not isinstance(values, list):
+            raise ValueError(f"Gemini response field `{key}` must be a list.")
+        cleaned = [clean_text(value) for value in values if isinstance(value, str) and clean_text(value)]
+        if len(cleaned) < count:
+            raise ValueError(f"Gemini returned fewer than {count} `{key}` solutions.")
+        output[key] = cleaned[:count]
+    return output
+
+
 def calculate_incongruity(idea: Dict[str, object]) -> Dict[str, Dict[str, float]]:
     """Calculate pairwise component tension across matching paraphrase embeddings."""
     embeddings = idea["embeddings"]

@@ -10,7 +10,13 @@ import logging
 
 from flask import Flask, jsonify, request
 
-from functions import full_analysis, load_baseline_dict, load_local_causal_lm
+from functions import (
+    full_analysis,
+    generate_surprise_thoughtstarters,
+    load_baseline_dict,
+    load_local_causal_lm,
+    score_solution_surprise,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -75,6 +81,56 @@ def score_campaign():
         return jsonify({"error": "Campaign scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
 
     return jsonify(_public_score_result(result))
+
+
+@app.route("/suprise_thoughtstarters", methods=["POST", "OPTIONS"])
+def suprise_thoughtstarters():
+    """Generate more/less chaotic solutions and score their surprisal."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({
+            "error": (
+                "Request body must be JSON: "
+                '{"cultural_observation": "...", "brand_problem": "..."}'
+            )
+        }), 400
+
+    extra_keys = sorted(set(payload) - {"cultural_observation", "brand_problem", "problem_to_solve"})
+    if extra_keys:
+        return jsonify({"error": "Only cultural observation and brand problem fields are accepted.", "extra_fields": extra_keys}), 400
+
+    cultural_observation = payload.get("cultural_observation")
+    brand_problem = payload.get("brand_problem", payload.get("problem_to_solve"))
+    if not isinstance(cultural_observation, str) or not cultural_observation.strip():
+        return jsonify({"error": "`cultural_observation` must be a non-empty string."}), 400
+    if not isinstance(brand_problem, str) or not brand_problem.strip():
+        return jsonify({"error": "`brand_problem` must be a non-empty string."}), 400
+
+    try:
+        started = time.perf_counter()
+        generated = generate_surprise_thoughtstarters(
+            cultural_observation.strip(),
+            brand_problem.strip(),
+        )
+        response = {
+            group: [
+                {
+                    "solution": solution,
+                    "surprise_score": score_solution_surprise(solution)["mean"],
+                }
+                for solution in solutions
+            ]
+            for group, solutions in generated.items()
+        }
+        app.logger.info("score_timing stage=thoughtstarters_total seconds=%.3f", time.perf_counter() - started)
+    except Exception as exc:
+        app.logger.exception("Surprise thoughtstarter generation failed")
+        return jsonify({"error": "Surprise thoughtstarter generation failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
+
+    return jsonify(response)
 
 
 if __name__ == "__main__":
