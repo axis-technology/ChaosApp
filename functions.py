@@ -29,6 +29,7 @@ import subprocess
 import html
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, cast
@@ -105,6 +106,7 @@ def get_gcloud_project() -> Optional[str]:
     return project if project and project != "(unset)" else None
 
 
+@lru_cache(maxsize=8)
 def get_gemini_client(
     project: Optional[str] = None,
     location: Optional[str] = None,
@@ -862,6 +864,47 @@ def preprocessing_value_generation(
     }
 
 
+def preprocessing_value_generation_fast(
+    cultural_observation: str,
+    problem_to_solve: str,
+    solution: str,
+    *,
+    paraphrase_count: int = 4,
+) -> Dict[str, object]:
+    """Same paraphrase/embedding methodology, with independent work parallelized."""
+    inputs = [cultural_observation, problem_to_solve, solution]
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        paraphrases = list(executor.map(
+            lambda text: generate_idea_paraphrases(text, n=paraphrase_count),
+            inputs,
+        ))
+
+    phrase_lists = [
+        paraphrases[i] + [clean_text(inputs[i])]
+        for i in range(3)
+    ]
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        embeddings = list(executor.map(embedding_output, phrase_lists))
+
+    return {
+        "input": {
+            "cultural_observation": clean_text(cultural_observation),
+            "problem_to_solve": clean_text(problem_to_solve),
+            "solution": clean_text(solution),
+        },
+        "paraphrases": {
+            "cultural_observation": phrase_lists[0],
+            "problem_to_solve": phrase_lists[1],
+            "solution": phrase_lists[2],
+        },
+        "embeddings": {
+            "cultural_observation": embeddings[0],
+            "problem_to_solve": embeddings[1],
+            "solution": embeddings[2],
+        },
+    }
+
+
 def select_baseline(embeddings: Sequence[Sequence[float]]) -> int:
     """Select the most central paraphrase embedding from a list."""
     if not embeddings:
@@ -1299,8 +1342,9 @@ def full_analysis(
     baseline: Dict[str, Dict[str, object]] | Dict[str, Dict[str, Dict[str, object]]] | Sequence[Dict[str, Dict[str, object]]],
     *,
     target_words: int = 14,
-    use_web_search: bool = True,
-    paraphrase_count: int = 4,
+    use_web_search: bool = False,
+    paraphrase_count: int = 0,
+    fast: bool = False,
 ) -> Dict[str, object]:
     """Standardize one campaign idea, extract components, and score it."""
     analysis_started = time.perf_counter()
@@ -1317,7 +1361,8 @@ def full_analysis(
     logger.info("score_timing stage=extract_components seconds=%.3f", time.perf_counter() - stage_started)
 
     stage_started = time.perf_counter()
-    campaign_embed_paraphrases = preprocessing_value_generation(
+    preprocessor = preprocessing_value_generation_fast if fast else preprocessing_value_generation
+    campaign_embed_paraphrases = preprocessor(
         cultural_observation=components_idea["cultural_observation"],
         problem_to_solve=components_idea["problem_to_solve"],
         solution=components_idea["solution"],
@@ -1387,6 +1432,117 @@ def full_analysis(
 
         },
     }
+
+
+def full_analysis_batch_fast(
+    campaigns: Sequence[str],
+    baseline: Dict[str, Dict[str, object]],
+    *,
+    target_words: int = 14,
+    use_web_search: bool = False,
+    paraphrase_count: int = 0,
+) -> List[Dict[str, object]]:
+    """Run the same analysis for multiple campaigns with batched surprise inference."""
+    def prepare(campaign: str) -> Dict[str, object]:
+        standardized_idea = standardize_idea(campaign)
+        components_idea = extract_campaign_components(
+            standardized_idea,
+            target_words=target_words,
+            use_web_search=use_web_search,
+        )
+        prepared = preprocessing_value_generation_fast(
+            cultural_observation=components_idea["cultural_observation"],
+            problem_to_solve=components_idea["problem_to_solve"],
+            solution=components_idea["solution"],
+            paraphrase_count=paraphrase_count,
+        )
+        return {
+            "campaign": campaign,
+            "standardized_idea": standardized_idea,
+            "components_idea": components_idea,
+            "prepared": prepared,
+        }
+
+    worker_count = min(4, max(1, len(campaigns)))
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        prepared_items = list(executor.map(prepare, campaigns))
+
+    surprise_pairs = []
+    for item in prepared_items:
+        for solution in item["prepared"]["paraphrases"]["solution"]:
+            surprise_pairs.append(("An example of a marketing campaign is", solution.lower()))
+
+    tokenizer, model = load_local_causal_lm()
+    surprise_results = batch_score_surprise(
+        surprise_pairs,
+        tokenizer=tokenizer,
+        model=model,
+        batch_size=16,
+    )
+
+    output = []
+    cursor = 0
+    for item in prepared_items:
+        prepared = item["prepared"]
+        count = len(prepared["paraphrases"]["solution"])
+        solution_scores = [r["avg_surprise_bits"] for r in surprise_results[cursor:cursor + count]]
+        cursor += count
+        surprise = summarize_values(solution_scores)
+        surprise["scores"] = solution_scores
+        surprise["solutions"] = prepared["paraphrases"]["solution"]
+
+        distance = distance_from_multiple_baselines(baseline, prepared)
+        distance_score = distance["distance_score"]
+        distance_std = distance["distance_score_std"]
+        tension = calculate_incongruity(prepared)
+        tension_score = calculate_weighted_score_tension(tension)
+        tension_std = calculate_weighted_score_tension(tension, "std")
+        surprise_score = surprise["mean"]
+        surprise_std = surprise["std"]
+        basic_score_result = predict_basicness_from_scores(
+            distance_score=distance_score,
+            surprise_score=surprise_score,
+            text=item["standardized_idea"],
+        )
+        basic_score, probability = normalize_basicness_result(basic_score_result)
+        universal_score_high = universal_score(
+            distance_score + distance_std * 2,
+            surprise_score + surprise_std * 2,
+            tension_score + tension_std * 2,
+            basic_score,
+            probability,
+        )
+        universal_score_ = universal_score(
+            distance_score, surprise_score, tension_score, basic_score, probability
+        )
+        universal_score_low = universal_score(
+            distance_score - distance_std * 2,
+            surprise_score - surprise_std * 2,
+            tension_score - tension_std * 2,
+            basic_score,
+            probability,
+        )
+        output.append({
+            "parts": {
+                "idea": item["campaign"],
+                "standardized_idea": item["standardized_idea"],
+                "components_idea": item["components_idea"],
+                "campaign_embed_paraphrases": prepared,
+                "distance": distance,
+                "surprise": surprise,
+                "tension": tension,
+                "basic": [basic_score, probability],
+            },
+            "scores": {
+                "distance_score": distance_score,
+                "surprise_score": surprise_score,
+                "tension_score": tension_score,
+                "basic_score": basic_score,
+                "universal_score": universal_score_,
+                "universal_score_range": [universal_score_low, universal_score_high],
+            },
+        })
+    return output
 
 
 def flatten_prior_art_batches_to_csv(

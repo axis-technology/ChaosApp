@@ -40,11 +40,13 @@ steps:
       - --memory
       - 8Gi
       - --cpu
-      - "2"
+      - "4"
       - --timeout
       - "600"
       - --min
       - "1"
+      - --concurrency
+      - "4"
       - --set-env-vars
       - GOOGLE_CLOUD_LOCATION=${_GOOGLE_CLOUD_LOCATION}
       - --set-secrets
