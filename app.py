@@ -35,7 +35,7 @@ app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 baseline = load_baseline_dict(BASELINE_PATH)
 SURPRISE_CANDIDATE_COUNT = 50
-TENSION_CANDIDATE_COUNT = 40
+TENSION_CANDIDATE_COUNT = 20
 SURPRISE_BATCH_SIZE = 32
 # Initialize the local model during instance startup. The loader caches the
 # tokenizer and model globally, so requests do not reload it.
@@ -84,6 +84,8 @@ def _campaign_payload(payload: Any) -> tuple[str | None, str | None]:
 
 
 def _clean_generated_line(value: object) -> str:
+    if isinstance(value, dict) and isinstance(value.get("idea"), str):
+        value = value["idea"]
     line = str(value).strip()
     return re.sub(r"^\s*(?:[-*]\s*|\d+[.)]\s*)", "", line).strip("`\" ")
 
@@ -154,6 +156,42 @@ def _generate_8ball_tension_ideas(campaign: str, count: int = TENSION_CANDIDATE_
     if len(ideas) < 15:
         raise ValueError(f"Gemini returned only {len(ideas)} usable tension ideas.")
     return ideas
+
+
+def _generate_underlying_observations(
+    campaign: str, ideas: list[str]
+) -> list[tuple[str, str]]:
+    system = (
+        "Return only valid JSON with keys `observations` and `formats`. Both values must be arrays "
+        "with exactly one item for each supplied idea, in the same order. Each observation must be "
+        "one concise sentence describing an existing human behavior, habit, situation, norm, or "
+        "cultural truth that the idea could be built from. Each format must contain only the "
+        "physical or experiential format, setting, or channel of the idea. Preserve the specific "
+        "domain and key noun that make the format recognizable, such as the type of venue, object, "
+        "device, platform, or public space. Exclude only the mechanism, visual treatment, message, "
+        "copy, and campaign claim from the format. Do not describe the campaign execution in the observation, "
+        "do not explain the strategy, and do not invent brand claims."
+    )
+    idea_lines = "\n".join(f"{index + 1}. {idea}" for index, idea in enumerate(ideas))
+    prompt = (
+        f"Original campaign:\n{campaign}\n\n"
+        f"Top displaced ideas:\n{idea_lines}\n\n"
+        "Return one underlying cultural observation for each idea in the same order."
+    )
+    result = gemini_json(prompt, system, temperature=0.3, max_output_tokens=2048)
+    observations = [str(value).strip() for value in result.get("observations", [])]
+    formats = [str(value).strip() for value in result.get("formats", [])]
+    if (
+        len(observations) != len(ideas)
+        or len(formats) != len(ideas)
+        or any(not observation for observation in observations)
+        or any(not format_name for format_name in formats)
+    ):
+        raise ValueError(
+            f"Gemini returned {len(observations)} observations and {len(formats)} formats; "
+            f"expected {len(ideas)} of each."
+        )
+    return list(zip(observations, formats))
 
 
 def _minmax(values: list[float]) -> list[float]:
@@ -348,7 +386,17 @@ def eightball_tension():
             max(0.1, min(0.9, 0.1 + 0.8 * score + random.uniform(-0.05, 0.05)))
             for score in normalized
         ]
-        return jsonify(_top_bottom(ideas, tension_scores))
+        ranked = _top_bottom(ideas, tension_scores)
+        top_ideas = [row["idea"] for row in ranked["top"][:5]]
+        observations_and_formats = _generate_underlying_observations(campaign, top_ideas)
+        for row, original_idea, (observation, format_name) in zip(
+            ranked["top"][:5], top_ideas, observations_and_formats
+        ):
+            format_name = format_name.rstrip(" .!?;:")
+            format_text = format_name[0].lower() + format_name[1:]
+            row["idea"] = f"{observation} How would you use a {format_text}?"
+            row["idea_underlying"] = original_idea
+        return jsonify(ranked)
     except Exception as exc:
         app.logger.exception("8Ball tension scoring failed")
         return jsonify({"error": "8Ball tension scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
