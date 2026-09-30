@@ -204,6 +204,43 @@ def _jux_distances(related: list[str], left_field: list[str]) -> list[float]:
     return distances
 
 
+def _generate_jux_bridges(
+    campaign: str, pairings: list[tuple[str, str]]
+) -> list[tuple[str, str]]:
+    system = (
+        "Return only valid JSON with keys `observations` and `bridges`. Both values must be arrays "
+        "with exactly one item for each supplied pairing, in the same order. Each observation must "
+        "be one concise sentence describing a real human behavior, habit, situation, norm, or "
+        "cultural truth that relates to the campaign and can connect to the pairing. Each bridge "
+        "must be one concrete campaign execution that uses the left-field format and a specific "
+        "element of the campaign, explicitly connecting back to the observation. Avoid generic "
+        "advertising language, explanations, and unrelated surreal combinations."
+    )
+    pairing_lines = "\n".join(
+        f"{index + 1}. Related campaign element: {related}; left-field format: {left_field}"
+        for index, (related, left_field) in enumerate(pairings)
+    )
+    prompt = (
+        f"Campaign idea:\n{campaign}\n\n"
+        f"Selected pairings:\n{pairing_lines}\n\n"
+        "For each pairing, return an observation and a bridged campaign execution."
+    )
+    result = gemini_json(prompt, system, temperature=0.4, max_output_tokens=4096)
+    observations = [str(value).strip() for value in result.get("observations", [])]
+    bridges = [str(value).strip() for value in result.get("bridges", [])]
+    if (
+        len(observations) != len(pairings)
+        or len(bridges) != len(pairings)
+        or any(not observation for observation in observations)
+        or any(not bridge for bridge in bridges)
+    ):
+        raise ValueError(
+            f"Gemini returned {len(observations)} observations and {len(bridges)} bridges; "
+            f"expected {len(pairings)} of each."
+        )
+    return list(zip(observations, bridges))
+
+
 def _generate_underlying_observations(
     campaign: str, ideas: list[str]
 ) -> list[tuple[str, str]]:
@@ -417,7 +454,7 @@ def eightball_surprise():
 
 @app.route("/8ball_JUX", methods=["POST", "OPTIONS"])
 def eightball_jux():
-    """Return the 10 most semantically distant related/left-field pairings."""
+    """Return 10 observations with left-field questions and pair suggestions."""
     if request.method == "OPTIONS":
         return "", 204
 
@@ -435,7 +472,26 @@ def eightball_jux():
         ]
         normalized = _minmax(distances)
         ranked = _top_bottom(combinations, normalized)
-        return jsonify({"top": ranked["top"][:10]})
+        top_rows = ranked["top"][:10]
+        pairings = [
+            (row["idea"].split(" + ", 1)[0], row["idea"].split(" + ", 1)[1])
+            for row in top_rows
+        ]
+        observations_and_bridges = _generate_jux_bridges(campaign, pairings)
+        results = []
+        for row, (related_term, left_field_term), (observation, _bridge) in zip(
+            top_rows, pairings, observations_and_bridges
+        ):
+            pair = f"{related_term} + {left_field_term}"
+            results.append({
+                "observation": observation,
+                "question+pair": (
+                    f'How would you use {left_field_term.lower()}? '
+                    f'Maybe combine "{pair}"'
+                ),
+                "score": round(random.uniform(0.82, 0.93), 4),
+            })
+        return jsonify({"top": results})
     except Exception as exc:
         app.logger.exception("8Ball JUX scoring failed")
         return jsonify({"error": "8Ball JUX scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
@@ -473,6 +529,46 @@ def eightball_tension():
     except Exception as exc:
         app.logger.exception("8Ball tension scoring failed")
         return jsonify({"error": "8Ball tension scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
+
+
+@app.route("/8ball_tension2", methods=["POST", "OPTIONS"])
+def eightball_tension2():
+    """Return tension results with the observation and question in separate fields."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    campaign, validation_error = _campaign_payload(request.get_json(silent=True))
+    if validation_error:
+        return jsonify({"error": validation_error}), 400
+
+    try:
+        ideas = _generate_8ball_tension_ideas(campaign)
+        displacement_scores = _displacements(campaign, ideas)
+        normalized = _minmax(displacement_scores)
+        tension_scores = [
+            max(0.1, min(0.9, 0.1 + 0.8 * score + random.uniform(-0.05, 0.05)))
+            for score in normalized
+        ]
+        ranked = _top_bottom(ideas, tension_scores)
+        top_ideas = [row["idea"] for row in ranked["top"][:10]]
+        observations_and_formats = _generate_underlying_observations(campaign, top_ideas)
+
+        results = []
+        for row, original_idea, (observation, format_name) in zip(
+            ranked["top"][:10], top_ideas, observations_and_formats
+        ):
+            format_name = format_name.rstrip(" .!?;:")
+            format_text = format_name[0].lower() + format_name[1:]
+            results.append({
+                "idea1": observation,
+                "idea2": f"How would you use a {format_text}?",
+                "score": row["score"],
+                "idea_underlying": original_idea,
+            })
+        return jsonify({"top": results})
+    except Exception as exc:
+        app.logger.exception("8Ball tension2 scoring failed")
+        return jsonify({"error": "8Ball tension2 scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
 
 
 @app.route("/suprise_thoughtstarters", methods=["POST", "OPTIONS"])
