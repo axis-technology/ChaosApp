@@ -158,6 +158,52 @@ def _generate_8ball_tension_ideas(campaign: str, count: int = TENSION_CANDIDATE_
     return ideas
 
 
+def _generate_8ball_jux_terms(campaign: str, count: int = 20) -> tuple[list[str], list[str]]:
+    system = (
+        "Return only valid JSON with keys `related` and `left_field`. Each value must be an array "
+        f"of exactly {count} unique one-word or two-word associations. `related` must contain "
+        "concrete, strong associations with the campaign. `left_field` must contain concrete words "
+        "or short phrases with no meaningful association to the campaign, chosen from completely "
+        "unexpected domains. Use nouns, objects, places, activities, materials, or visible things. "
+        "Do not use abstract concepts, explanations, duplicates, or multi-word phrases longer than "
+        "two words."
+    )
+    prompt = (
+        f"Campaign idea:\n{campaign}\n\n"
+        f"Generate exactly {count} related associations and exactly {count} completely left-field "
+        "associations."
+    )
+    result = gemini_json(prompt, system, temperature=1.1, max_output_tokens=4096)
+    related = _unique_strings(result.get("related"))
+    left_field = _unique_strings(result.get("left_field"))
+    if len(related) < count or len(left_field) < count:
+        raise ValueError(
+            f"Gemini returned {len(related)} related and {len(left_field)} left-field terms; "
+            f"expected {count} of each."
+        )
+    return related[:count], left_field[:count]
+
+
+def _jux_distances(related: list[str], left_field: list[str]) -> list[float]:
+    terms = related + left_field
+    vectors = []
+    for start in range(0, len(terms), 100):
+        vectors.extend(gemini_embeddings_batch(terms[start:start + 100]))
+
+    distances = []
+    for related_index in range(len(related)):
+        related_vector = vectors[related_index]
+        related_norm = sum(value * value for value in related_vector) ** 0.5
+        for left_field_index in range(len(left_field)):
+            left_field_vector = vectors[len(related) + left_field_index]
+            left_field_norm = sum(value * value for value in left_field_vector) ** 0.5
+            similarity = sum(
+                a * b for a, b in zip(related_vector, left_field_vector)
+            ) / (related_norm * left_field_norm)
+            distances.append(1.0 - similarity)
+    return distances
+
+
 def _generate_underlying_observations(
     campaign: str, ideas: list[str]
 ) -> list[tuple[str, str]]:
@@ -336,7 +382,7 @@ def score_campaigns_fast():
 
 @app.route("/8ball_surprise", methods=["POST", "OPTIONS"])
 def eightball_surprise():
-    """Return the top and bottom campaign associations by combined score."""
+    """Return the top 10 campaign associations by combined score."""
     if request.method == "OPTIONS":
         return "", 204
 
@@ -362,15 +408,42 @@ def eightball_surprise():
                 displacement_normalized,
             )
         ]
-        return jsonify(_top_bottom(terms, combined_scores))
+        ranked = _top_bottom(terms, combined_scores)
+        return jsonify({"top": ranked["top"][:10]})
     except Exception as exc:
         app.logger.exception("8Ball surprise scoring failed")
         return jsonify({"error": "8Ball surprise scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
 
 
+@app.route("/8ball_JUX", methods=["POST", "OPTIONS"])
+def eightball_jux():
+    """Return the 10 most semantically distant related/left-field pairings."""
+    if request.method == "OPTIONS":
+        return "", 204
+
+    campaign, validation_error = _campaign_payload(request.get_json(silent=True))
+    if validation_error:
+        return jsonify({"error": validation_error}), 400
+
+    try:
+        related, left_field = _generate_8ball_jux_terms(campaign)
+        distances = _jux_distances(related, left_field)
+        combinations = [
+            f"{related_term} + {left_field_term}"
+            for related_term in related
+            for left_field_term in left_field
+        ]
+        normalized = _minmax(distances)
+        ranked = _top_bottom(combinations, normalized)
+        return jsonify({"top": ranked["top"][:10]})
+    except Exception as exc:
+        app.logger.exception("8Ball JUX scoring failed")
+        return jsonify({"error": "8Ball JUX scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
+
+
 @app.route("/8ball_tension", methods=["POST", "OPTIONS"])
 def eightball_tension():
-    """Return the top and bottom campaign executions by normalized tension."""
+    """Return the top 10 campaign executions by normalized tension."""
     if request.method == "OPTIONS":
         return "", 204
 
@@ -387,16 +460,16 @@ def eightball_tension():
             for score in normalized
         ]
         ranked = _top_bottom(ideas, tension_scores)
-        top_ideas = [row["idea"] for row in ranked["top"][:5]]
+        top_ideas = [row["idea"] for row in ranked["top"][:10]]
         observations_and_formats = _generate_underlying_observations(campaign, top_ideas)
         for row, original_idea, (observation, format_name) in zip(
-            ranked["top"][:5], top_ideas, observations_and_formats
+            ranked["top"][:10], top_ideas, observations_and_formats
         ):
             format_name = format_name.rstrip(" .!?;:")
             format_text = format_name[0].lower() + format_name[1:]
             row["idea"] = f"{observation} How would you use a {format_text}?"
             row["idea_underlying"] = original_idea
-        return jsonify(ranked)
+        return jsonify({"top": ranked["top"][:10]})
     except Exception as exc:
         app.logger.exception("8Ball tension scoring failed")
         return jsonify({"error": "8Ball tension scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
