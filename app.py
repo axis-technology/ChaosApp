@@ -17,6 +17,7 @@ from functions import (
     full_analysis,
     full_analysis_batch_fast,
     batch_score_surprise,
+    cosine_similarity,
     GEMINI_MODEL,
     get_gemini_client,
     gemini_embeddings_batch,
@@ -285,6 +286,11 @@ def _minmax(values: list[float]) -> list[float]:
     return [(value - low) / (high - low) for value in values]
 
 
+def _similarity_score(vector_a: list[float], vector_b: list[float]) -> float:
+    """Map cosine similarity from [-1, 1] to a convenient [0, 1] score."""
+    return max(0.0, min(1.0, (cosine_similarity(vector_a, vector_b) + 1.0) / 2.0))
+
+
 def _displacements(campaign: str, candidates: list[str]) -> list[float]:
     embedding_inputs = [campaign] + candidates
     vectors = []
@@ -446,6 +452,15 @@ def eightball_surprise():
             )
         ]
         ranked = _top_bottom(terms, combined_scores)
+        score_by_term = {
+            term: {
+                "score_probability": 2.0 ** (-float(result["average_surprise_bits"])),
+                "score_bits": float(result["average_surprise_bits"]),
+            }
+            for term, result in zip(terms, surprise_results)
+        }
+        for row in ranked["top"][:10]:
+            row.update(score_by_term[row["idea"]])
         return jsonify({"top": ranked["top"][:10]})
     except Exception as exc:
         app.logger.exception("8Ball surprise scoring failed")
@@ -478,19 +493,66 @@ def eightball_jux():
             for row in top_rows
         ]
         observations_and_bridges = _generate_jux_bridges(campaign, pairings)
+        questions = [
+            f"How would you use {left_field_term.lower()}?"
+            for _, left_field_term in pairings
+        ]
+        pair_texts = [f"{related_term} {left_field_term}" for related_term, left_field_term in pairings]
+        embedding_inputs = (
+            [campaign]
+            + [observation for observation, _ in observations_and_bridges]
+            + questions
+            + pair_texts
+            + [left_field_term for _, left_field_term in pairings]
+        )
+        embedding_vectors = gemini_embeddings_batch(embedding_inputs)
+        campaign_vector = embedding_vectors[0]
+        observation_start = 1
+        question_start = observation_start + len(pairings)
+        pair_start = question_start + len(pairings)
+        left_field_start = pair_start + len(pairings)
+
         results = []
-        for row, (related_term, left_field_term), (observation, _bridge) in zip(
+        for index, (row, (related_term, left_field_term), (observation, _bridge)) in enumerate(zip(
             top_rows, pairings, observations_and_bridges
-        ):
+        )):
             pair = f"{related_term} + {left_field_term}"
+            observation_score = (
+                0.60 * _similarity_score(
+                    embedding_vectors[observation_start + index], campaign_vector
+                )
+                + 0.40 * _similarity_score(
+                    embedding_vectors[observation_start + index],
+                    embedding_vectors[pair_start + index],
+                )
+            )
+            question_specificity = 1.0 if left_field_term.lower() in questions[index].lower() else 0.0
+            question_score = (
+                0.50 * _similarity_score(
+                    embedding_vectors[question_start + index],
+                    embedding_vectors[left_field_start + index],
+                )
+                + 0.30 * _similarity_score(
+                    embedding_vectors[question_start + index], campaign_vector
+                )
+                + 0.20 * question_specificity
+            )
+            pair_score = float(row["score"])
+            overall_score = (
+                0.40 * pair_score
+                + 0.35 * observation_score
+                + 0.25 * question_score
+            )
             results.append({
                 "observation": observation,
-                "question+pair": (
-                    f'How would you use {left_field_term.lower()}? '
-                    f'Maybe combine "{pair}"'
-                ),
-                "score": round(random.uniform(0.82, 0.93), 4),
+                "observation_score": round(observation_score, 4),
+                "question": questions[index],
+                "question_score": round(question_score, 4),
+                "pair": pair,
+                "pair_score": round(pair_score, 4),
+                "score": round(overall_score, 4),
             })
+        results.sort(key=lambda result: result["score"], reverse=True)
         return jsonify({"top": results})
     except Exception as exc:
         app.logger.exception("8Ball JUX scoring failed")
