@@ -1361,8 +1361,9 @@ def full_analysis(
     logger.info("score_timing stage=extract_components seconds=%.3f", time.perf_counter() - stage_started)
 
     stage_started = time.perf_counter()
-    preprocessor = preprocessing_value_generation_fast if fast else preprocessing_value_generation
-    campaign_embed_paraphrases = preprocessor(
+    # Paraphrase generation and embedding calls are independent across the
+    # three extracted components, so always use the parallel implementation.
+    campaign_embed_paraphrases = preprocessing_value_generation_fast(
         cultural_observation=components_idea["cultural_observation"],
         problem_to_solve=components_idea["problem_to_solve"],
         solution=components_idea["solution"],
@@ -1371,22 +1372,26 @@ def full_analysis(
     logger.info("score_timing stage=paraphrases_and_embeddings seconds=%.3f", time.perf_counter() - stage_started)
 
     stage_started = time.perf_counter()
-    distance = distance_from_multiple_baselines(baseline, campaign_embed_paraphrases)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        distance_future = executor.submit(
+            distance_from_multiple_baselines, baseline, campaign_embed_paraphrases
+        )
+        surprise_future = executor.submit(calc_surprise, campaign_embed_paraphrases)
+        tension_future = executor.submit(calculate_incongruity, campaign_embed_paraphrases)
+        distance = distance_future.result()
+        surprise = surprise_future.result()
+        tension = tension_future.result()
+
     distance_score = distance["distance_score"]
     distance_std= distance['distance_score_std']
     logger.info("score_timing stage=distance seconds=%.3f", time.perf_counter() - stage_started)
 
-    stage_started = time.perf_counter()
-    surprise = calc_surprise(campaign_embed_paraphrases)
     surprise_score = surprise["mean"]
     surprise_std = surprise["std"]
-    logger.info("score_timing stage=surprise seconds=%.3f", time.perf_counter() - stage_started)
 
-    stage_started = time.perf_counter()
-    tension = calculate_incongruity(campaign_embed_paraphrases)
     tension_score = calculate_weighted_score_tension(tension)
     tension_std = calculate_weighted_score_tension(tension,'std')
-    logger.info("score_timing stage=tension seconds=%.3f", time.perf_counter() - stage_started)
+    logger.info("score_timing stage=distance_surprise_tension_parallel seconds=%.3f", time.perf_counter() - stage_started)
 
     stage_started = time.perf_counter()
     basic_score_result = predict_basicness_from_scores(distance_score=distance_score,

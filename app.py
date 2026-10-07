@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict
+from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 import logging
-import random
 import re
 
 from flask import Flask, jsonify, request
@@ -22,10 +22,8 @@ from functions import (
     get_gemini_client,
     gemini_embeddings_batch,
     gemini_json,
-    generate_surprise_thoughtstarters,
     load_baseline_dict,
     load_local_causal_lm,
-    score_solution_surprise,
 )
 
 
@@ -36,7 +34,6 @@ app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
 baseline = load_baseline_dict(BASELINE_PATH)
 SURPRISE_CANDIDATE_COUNT = 50
-TENSION_CANDIDATE_COUNT = 20
 SURPRISE_BATCH_SIZE = 32
 # Initialize the local model during instance startup. The loader caches the
 # tokenizer and model globally, so requests do not reload it.
@@ -138,27 +135,6 @@ def _generate_8ball_terms(campaign: str, count: int = SURPRISE_CANDIDATE_COUNT) 
     return answers
 
 
-def _generate_8ball_tension_ideas(campaign: str, count: int = TENSION_CANDIDATE_COUNT) -> list[str]:
-    system = (
-        "Return only valid JSON with key `ideas`, whose value is an array of distinct campaign "
-        "execution ideas. Return exactly the requested number. Each idea must be a concrete action, "
-        "object, place, service, interface, ritual, or media format that a real campaign could use. "
-        "Explore semantic displacement by combining the campaign with unexpected domains such as "
-        "buildings, public infrastructure, transport, weather, games, retail, archives, or household "
-        "objects. Make each idea specific, use a distinct mechanism or format, keep a plausible bridge "
-        "to the campaign, and avoid explanations or repeated mechanisms."
-    )
-    prompt = (
-        f"Original campaign:\n{campaign}\n\n"
-        f"Generate exactly {count} different displaced campaign executions."
-    )
-    result = gemini_json(prompt, system, temperature=1.1, max_output_tokens=max(4096, count * 35))
-    ideas = _unique_strings(result.get("ideas"))
-    if len(ideas) < 15:
-        raise ValueError(f"Gemini returned only {len(ideas)} usable tension ideas.")
-    return ideas
-
-
 def _generate_8ball_jux_terms(campaign: str, count: int = 20) -> tuple[list[str], list[str]]:
     system = (
         "Return only valid JSON with keys `related` and `left_field`. Each value must be an array "
@@ -240,42 +216,6 @@ def _generate_jux_bridges(
             f"expected {len(pairings)} of each."
         )
     return list(zip(observations, bridges))
-
-
-def _generate_underlying_observations(
-    campaign: str, ideas: list[str]
-) -> list[tuple[str, str]]:
-    system = (
-        "Return only valid JSON with keys `observations` and `formats`. Both values must be arrays "
-        "with exactly one item for each supplied idea, in the same order. Each observation must be "
-        "one concise sentence describing an existing human behavior, habit, situation, norm, or "
-        "cultural truth that the idea could be built from. Each format must contain only the "
-        "physical or experiential format, setting, or channel of the idea. Preserve the specific "
-        "domain and key noun that make the format recognizable, such as the type of venue, object, "
-        "device, platform, or public space. Exclude only the mechanism, visual treatment, message, "
-        "copy, and campaign claim from the format. Do not describe the campaign execution in the observation, "
-        "do not explain the strategy, and do not invent brand claims."
-    )
-    idea_lines = "\n".join(f"{index + 1}. {idea}" for index, idea in enumerate(ideas))
-    prompt = (
-        f"Original campaign:\n{campaign}\n\n"
-        f"Top displaced ideas:\n{idea_lines}\n\n"
-        "Return one underlying cultural observation for each idea in the same order."
-    )
-    result = gemini_json(prompt, system, temperature=0.3, max_output_tokens=2048)
-    observations = [str(value).strip() for value in result.get("observations", [])]
-    formats = [str(value).strip() for value in result.get("formats", [])]
-    if (
-        len(observations) != len(ideas)
-        or len(formats) != len(ideas)
-        or any(not observation for observation in observations)
-        or any(not format_name for format_name in formats)
-    ):
-        raise ValueError(
-            f"Gemini returned {len(observations)} observations and {len(formats)} formats; "
-            f"expected {len(ideas)} of each."
-        )
-    return list(zip(observations, formats))
 
 
 def _minmax(values: list[float]) -> list[float]:
@@ -436,12 +376,16 @@ def eightball_surprise():
     try:
         terms = _generate_8ball_terms(campaign)
         context = f"Campaign idea: {campaign}\n\nWe want to do something with"
-        surprise_results = batch_score_surprise(
-            [(context, term) for term in terms],
-            batch_size=SURPRISE_BATCH_SIZE,
-        )
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            surprise_future = executor.submit(
+                batch_score_surprise,
+                [(context, term) for term in terms],
+                batch_size=SURPRISE_BATCH_SIZE,
+            )
+            displacement_future = executor.submit(_displacements, campaign, terms)
+            surprise_results = surprise_future.result()
+            displacement_scores = displacement_future.result()
         surprise_scores = [float(result["average_surprise_bits"]) for result in surprise_results]
-        displacement_scores = _displacements(campaign, terms)
         surprise_normalized = _minmax(surprise_scores)
         displacement_normalized = _minmax(displacement_scores)
         combined_scores = [
@@ -557,130 +501,6 @@ def eightball_jux():
     except Exception as exc:
         app.logger.exception("8Ball JUX scoring failed")
         return jsonify({"error": "8Ball JUX scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
-
-
-@app.route("/8ball_tension", methods=["POST", "OPTIONS"])
-def eightball_tension():
-    """Return the top 10 campaign executions by normalized tension."""
-    if request.method == "OPTIONS":
-        return "", 204
-
-    campaign, validation_error = _campaign_payload(request.get_json(silent=True))
-    if validation_error:
-        return jsonify({"error": validation_error}), 400
-
-    try:
-        ideas = _generate_8ball_tension_ideas(campaign)
-        displacement_scores = _displacements(campaign, ideas)
-        normalized = _minmax(displacement_scores)
-        tension_scores = [
-            max(0.1, min(0.9, 0.1 + 0.8 * score + random.uniform(-0.05, 0.05)))
-            for score in normalized
-        ]
-        ranked = _top_bottom(ideas, tension_scores)
-        top_ideas = [row["idea"] for row in ranked["top"][:10]]
-        observations_and_formats = _generate_underlying_observations(campaign, top_ideas)
-        for row, original_idea, (observation, format_name) in zip(
-            ranked["top"][:10], top_ideas, observations_and_formats
-        ):
-            format_name = format_name.rstrip(" .!?;:")
-            format_text = format_name[0].lower() + format_name[1:]
-            row["idea"] = f"{observation} How would you use a {format_text}?"
-            row["idea_underlying"] = original_idea
-        return jsonify({"top": ranked["top"][:10]})
-    except Exception as exc:
-        app.logger.exception("8Ball tension scoring failed")
-        return jsonify({"error": "8Ball tension scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
-
-
-@app.route("/8ball_tension2", methods=["POST", "OPTIONS"])
-def eightball_tension2():
-    """Return tension results with the observation and question in separate fields."""
-    if request.method == "OPTIONS":
-        return "", 204
-
-    campaign, validation_error = _campaign_payload(request.get_json(silent=True))
-    if validation_error:
-        return jsonify({"error": validation_error}), 400
-
-    try:
-        ideas = _generate_8ball_tension_ideas(campaign)
-        displacement_scores = _displacements(campaign, ideas)
-        normalized = _minmax(displacement_scores)
-        tension_scores = [
-            max(0.1, min(0.9, 0.1 + 0.8 * score + random.uniform(-0.05, 0.05)))
-            for score in normalized
-        ]
-        ranked = _top_bottom(ideas, tension_scores)
-        top_ideas = [row["idea"] for row in ranked["top"][:10]]
-        observations_and_formats = _generate_underlying_observations(campaign, top_ideas)
-
-        results = []
-        for row, original_idea, (observation, format_name) in zip(
-            ranked["top"][:10], top_ideas, observations_and_formats
-        ):
-            format_name = format_name.rstrip(" .!?;:")
-            format_text = format_name[0].lower() + format_name[1:]
-            results.append({
-                "idea1": observation,
-                "idea2": f"How would you use a {format_text}?",
-                "score": row["score"],
-                "idea_underlying": original_idea,
-            })
-        return jsonify({"top": results})
-    except Exception as exc:
-        app.logger.exception("8Ball tension2 scoring failed")
-        return jsonify({"error": "8Ball tension2 scoring failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
-
-
-@app.route("/suprise_thoughtstarters", methods=["POST", "OPTIONS"])
-def suprise_thoughtstarters():
-    """Generate more/less chaotic solutions and score their surprisal."""
-    if request.method == "OPTIONS":
-        return "", 204
-
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({
-            "error": (
-                "Request body must be JSON: "
-                '{"cultural_observation": "...", "brand_problem": "..."}'
-            )
-        }), 400
-
-    extra_keys = sorted(set(payload) - {"cultural_observation", "brand_problem", "problem_to_solve"})
-    if extra_keys:
-        return jsonify({"error": "Only cultural observation and brand problem fields are accepted.", "extra_fields": extra_keys}), 400
-
-    cultural_observation = payload.get("cultural_observation")
-    brand_problem = payload.get("brand_problem", payload.get("problem_to_solve"))
-    if not isinstance(cultural_observation, str) or not cultural_observation.strip():
-        return jsonify({"error": "`cultural_observation` must be a non-empty string."}), 400
-    if not isinstance(brand_problem, str) or not brand_problem.strip():
-        return jsonify({"error": "`brand_problem` must be a non-empty string."}), 400
-
-    try:
-        started = time.perf_counter()
-        generated = generate_surprise_thoughtstarters(
-            cultural_observation.strip(),
-            brand_problem.strip(),
-        )
-        response = {
-            group: [
-                {
-                    "solution": solution,
-                    "surprise_score": score_solution_surprise(solution)["mean"],
-                }
-                for solution in solutions
-            ]
-            for group, solutions in generated.items()
-        }
-        app.logger.info("score_timing stage=thoughtstarters_total seconds=%.3f", time.perf_counter() - started)
-    except Exception as exc:
-        app.logger.exception("Surprise thoughtstarter generation failed")
-        return jsonify({"error": "Surprise thoughtstarter generation failed.", "detail": f"{type(exc).__name__}: {exc}"}), 500
-
-    return jsonify(response)
 
 
 if __name__ == "__main__":

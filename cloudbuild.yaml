@@ -43,8 +43,9 @@ steps:
       - "4"
       - --timeout
       - "600"
-      - --min
+      - --min-instances
       - "1"
+      - --cpu-boost
       - --concurrency
       - "4"
       - --set-env-vars
