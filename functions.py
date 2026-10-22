@@ -42,7 +42,7 @@ from google.genai import types
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Text and embedding models copied from NewProcess/exp2_idea_paraphrase_scores.ipynb.
-GEMINI_MODEL = "gemini-3.7-flash"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 #CAUSAL_LM_MODEL = "Qwen/Qwen3-4B-Base"
 CAUSAL_LM_MODEL = os.environ.get("CAUSAL_LM_MODEL", "Qwen/Qwen3-0.6B-Base")
@@ -117,7 +117,8 @@ def get_gemini_client(
 
     This follows the Exp 2 notebook behavior: use Vertex when a project is
     available, otherwise use an API key. `gemini-2.5-flash` and
-    `gemini-embedding-001` work through the tested Vertex route.
+    `gemini-embedding-001` work through the tested Vertex route. The configured
+    Flash-Lite model requires the Gemini API-key route in this project.
     """
     project = project or os.environ.get("GOOGLE_CLOUD_PROJECT") or get_gcloud_project()
     location = location or os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
@@ -127,7 +128,7 @@ def get_gemini_client(
         return genai.Client(vertexai=False, api_key=api_key)
     if require_api_key:
         raise ValueError(
-            "gemini-3.7-flash must use the Gemini API-key route in this project. "
+            f"{GEMINI_MODEL} must use the Gemini API-key route in this project. "
             "Set GOOGLE_CLOUD_API_KEY before calling this function."
         )
     if project:
@@ -166,7 +167,7 @@ def gemini_json(
 ) -> Dict[str, object]:
     """Call Gemini and parse a JSON response."""
     model = model or GEMINI_MODEL
-    client = get_gemini_client(require_api_key=(model == "gemini-3.7-flash"))
+    client = get_gemini_client(require_api_key=(model == GEMINI_MODEL))
     contents = [types.Content(role="user", parts=[types.Part.from_text(text=prompt)])]
     config_kwargs = {
         "max_output_tokens": max_output_tokens,
