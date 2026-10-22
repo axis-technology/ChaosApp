@@ -710,8 +710,10 @@ def add_incongruity_scores(ideas: pd.DataFrame, *_, **__) -> pd.DataFrame:
     return add_relationship_incongruity_scores(ideas)
 
 
-def validate_campaign_components(result: Dict[str, object], target_words: int) -> Dict[str, str]:
-    """Validate component extractor output shape and word counts."""
+def validate_campaign_components(
+    result: Dict[str, object], target_words: int, margin_of_error: int = 4
+) -> Dict[str, str]:
+    """Validate component extractor output shape and allow a word-count margin."""
     required = ["cultural_observation", "problem_to_solve", "solution"]
     missing = [key for key in required if key not in result]
     if missing:
@@ -719,9 +721,18 @@ def validate_campaign_components(result: Dict[str, object], target_words: int) -
 
     cleaned = {key: clean_text(result[key]) for key in required}
     counts = {key: count_words(value) for key, value in cleaned.items()}
-    bad = {key: value for key, value in counts.items() if value != target_words}
+    minimum_words = max(0, target_words - margin_of_error)
+    maximum_words = target_words + margin_of_error
+    bad = {
+        key: value
+        for key, value in counts.items()
+        if value < minimum_words or value > maximum_words
+    }
     if bad:
-        raise ValueError(f"Each field must have exactly {target_words} words. Got: {counts}")
+        raise ValueError(
+            f"Each field must have {minimum_words}–{maximum_words} words "
+            f"(target {target_words} ±{margin_of_error}). Got: {counts}"
+        )
     if not cleaned["problem_to_solve"].startswith("A brand is trying to"):
         raise ValueError("problem_to_solve must start with: A brand is trying to")
 
